@@ -8,6 +8,9 @@
 Automatically rotate OpenCode Zen API keys to avoid rate limits and dead key
 downtime. Dashboard UI + agent integration in one plugin.
 
+<img width="1921" height="967" alt="image" src="https://github.com/user-attachments/assets/dc9b0f00-5104-4973-b39a-6359e276fdba" />
+
+
 ---
 
 ## Features
