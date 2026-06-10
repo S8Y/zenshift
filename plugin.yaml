@@ -1,0 +1,6 @@
+manifest_version: 1
+name: zenshift
+version: 0.1.0
+description: "OpenCode Zen API key rotation manager — manage multiple API keys, rotate on schedule or on error, blacklist dead keys."
+homepage: "https://github.com/zo/zencode"
+author: "Zo"

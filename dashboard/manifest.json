@@ -1,0 +1,14 @@
+{
+  "name": "zenshift",
+  "label": "ZenShift",
+  "description": "OpenCode Zen API key rotation manager — manage keys, set rotation strategy, blacklist dead keys.",
+  "icon": "RefreshCw",
+  "version": "0.1.0",
+  "tab": {
+    "path": "/zenshift",
+    "position": "after:config"
+  },
+  "entry": "dist/index.js",
+  "css": "dist/style.css",
+  "api": "plugin_api.py"
+}
