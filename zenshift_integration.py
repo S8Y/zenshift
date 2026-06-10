@@ -16,8 +16,10 @@ logger = logging.getLogger("zenshift.integration")
 _integration_installed = False
 _background_thread: threading.Thread | None = None
 _stop_event = threading.Event()
-_ENV_PATH = Path(os.path.expanduser("~/.hermes/.env"))
+_HERMES_HOME = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+_ENV_PATH = _HERMES_HOME / ".env"
 _ENV_VAR = "OPENCODE_ZEN_API_KEY"
+
 
 def _read_env_file() -> dict[str, str]:
     env: dict[str, str] = {}
@@ -33,79 +35,100 @@ def _read_env_file() -> dict[str, str]:
         logger.warning("Failed to read %s: %s", _ENV_PATH, exc)
     return env
 
-def _write_env_file(env: dict[str, str]) -> None:
+
+def _write_env_file(updates: dict[str, str]) -> bool:
+    """Update specific keys in .env, preserving all others."""
     try:
-        content = "\n".join(f"{k}={v}" for k, v in env.items() if k.strip())
-        tmp = _ENV_PATH.with_suffix(".env.tmp")
-        tmp.write_text(content + "\n")
-        tmp.replace(_ENV_PATH)
+        current_env = _read_env_file()
+        current_env.update(updates)
+        lines = []
+        existing_keys = set(updates.keys())
+        if _ENV_PATH.exists():
+            for line in _ENV_PATH.read_text().splitlines():
+                stripped = line.strip()
+                if "=" not in stripped or stripped.startswith("#"):
+                    lines.append(line)
+                    continue
+                key = stripped.split("=", 1)[0].strip()
+                if key in updates:
+                    lines.append(f'{key}="{updates[key]}"')
+                    existing_keys.discard(key)
+                else:
+                    lines.append(line)
+        for key in existing_keys:
+            lines.append(f'{key}="{updates[key]}"')
+        _ENV_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return True
     except OSError as exc:
         logger.warning("Failed to write %s: %s", _ENV_PATH, exc)
+        return False
+
 
 def _get_plugin_api():
+    """Try to import the dashboard plugin_api module directly."""
     try:
-        from zenshift.dashboard import plugin_api
-        return plugin_api
-    except ImportError:
-        try:
-            import importlib
-            spec = importlib.util.find_spec("zenshift.dashboard.plugin_api")
+        spec = None
+        dashboard_dir = _HERMES_HOME / "plugins" / "zenshift" / "dashboard"
+        api_path = dashboard_dir / "plugin_api.py"
+        if api_path.exists():
+            import importlib.util
+            mod_name = "zenshift_dashboard_api"
+            spec = importlib.util.spec_from_file_location(mod_name, str(api_path))
             if spec and spec.loader:
                 mod = importlib.util.module_from_spec(spec)
+                sys.modules[mod_name] = mod
                 spec.loader.exec_module(mod)
                 return mod
-        except (ImportError, AttributeError):
-            pass
-        return None
+    except Exception:
+        pass
+    return None
+
 
 def _install_error_feed():
-    global _ORIGINAL_CLASSIFY_API_ERROR
     try:
-        from agent import error_classifier
+        from agent import error_classifier as _ec
     except ImportError:
-        logger.warning("Cannot import agent.error_classifier")
+        logger.debug("ZenShift: agent.error_classifier not available")
         return
-    if not hasattr(error_classifier, "classify_api_error"):
+    if not hasattr(_ec, "classify_api_error"):
+        logger.debug("ZenShift: no classify_api_error to patch")
         return
 
-    _ORIGINAL_CLASSIFY_API_ERROR = error_classifier.classify_api_error
+    _orig = _ec.classify_api_error
 
-    def _patched_classify_api_error(error, **kwargs):
+    def _patched(error, **kwargs):
         provider = kwargs.get("provider", "").strip().lower()
         if "opencode" in provider or provider in ("zen",):
             try:
-                error_text = str(error)
                 api = _get_plugin_api()
                 if api is not None:
-                    result = api.report_error({"error": error_text})
+                    result = api.report_error({"error": str(error)})
                     action = result.get("action", "none")
-                    if action == "ratelimit_rotated":
-                        logger.info("ZenShift: rotated on rate-limit")
-                    elif action == "blacklisted_and_rotated":
-                        logger.info("ZenShift: blacklisted + rotated on dead key")
+                    if action in ("rotated", "blacklisted_and_rotated"):
+                        logger.info("ZenShift: %s on %s", action, result.get("reason", "error"))
             except Exception:
                 pass
-        return _ORIGINAL_CLASSIFY_API_ERROR(error, **kwargs)
+        return _orig(error, **kwargs)
 
-    error_classifier.classify_api_error = _patched_classify_api_error
-    logger.info("ZenShift: patched classify_api_error")
+    _ec.classify_api_error = _patched
+    logger.info("ZenShift: patched classify_api_error for OpenCode/Zen providers")
+
 
 def _install_client_key_injection():
     try:
-        import run_agent
+        import run_agent as _ra
     except ImportError:
-        logger.warning("Cannot import run_agent")
+        logger.debug("ZenShift: run_agent not available")
         return
-    cls = getattr(run_agent, "AIAgent", None)
+    cls = getattr(_ra, "AIAgent", None)
     if cls is None:
         return
     orig = getattr(cls, "_create_request_openai_client", None)
     if orig is None:
         return
 
-    def _patched_create_client(self, **kwargs):
+    def _patched(self, **kwargs):
         _ensure_key_active()
-        # Count API call attempt (for per-api-call strategy)
         try:
             api = _get_plugin_api()
             if api is not None:
@@ -114,8 +137,9 @@ def _install_client_key_injection():
             pass
         return orig(self, **kwargs)
 
-    setattr(cls, "_create_request_openai_client", _patched_create_client)
+    setattr(cls, "_create_request_openai_client", _patched)
     logger.info("ZenShift: patched _create_request_openai_client")
+
 
 def _ensure_key_active():
     try:
@@ -125,11 +149,10 @@ def _ensure_key_active():
         api.check_timed()
         if api._active_key and os.environ.get(_ENV_VAR) != api._active_key:
             os.environ[_ENV_VAR] = api._active_key
-            env = _read_env_file()
-            env[_ENV_VAR] = api._active_key
-            _write_env_file(env)
+            _write_env_file({_ENV_VAR: api._active_key})
     except Exception as exc:
         logger.debug("ZenShift ensure_key_active: %s", exc)
+
 
 def _background_loop(interval: float = 10.0):
     while not _stop_event.is_set():
@@ -141,6 +164,7 @@ def _background_loop(interval: float = 10.0):
         except Exception:
             pass
         _stop_event.wait(interval)
+
 
 def _start_background_thread(interval: float = 10.0):
     global _background_thread
@@ -154,17 +178,18 @@ def _start_background_thread(interval: float = 10.0):
     _background_thread.start()
     logger.info("ZenShift: bg thread started (%ss)", interval)
 
+
 def _on_session_start():
     try:
         api = _get_plugin_api()
         if api is None:
             return
         result = api.reset_session()
-        if result.get("rotated"):
-            key = result.get("new_key", "")
-            logger.info("ZenShift: session rotate -> %s...", key[:8] if key else "none")
+        if result.get("status") == "rotated_for_new_session":
+            logger.info("ZenShift: session rotate")
     except Exception as exc:
         logger.debug("ZenShift session start: %s", exc)
+
 
 def install():
     global _integration_installed
@@ -181,6 +206,7 @@ def install():
     import atexit
     atexit.register(lambda: _stop_event.set())
 
+
 def rotate_now() -> dict:
     try:
         api = _get_plugin_api()
@@ -196,4 +222,3 @@ def rotate_now() -> dict:
         }
     except Exception as exc:
         return {"status": "error", "message": str(exc)}
-

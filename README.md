@@ -1,81 +1,108 @@
 # ZenShift
 
-**Automatic OpenCode Zen API key rotation for Hermes Agent.**
+**OpenCode Zen API key rotation manager for Hermes Agent.**
 
-ZenShift is a Hermes dashboard plugin that manages a pool of OpenCode Zen API keys
-and rotates them automatically through configurable strategies. It detects API
-errors at runtime and swaps keys instantly — no manual intervention needed.
+![version](https://img.shields.io/badge/version-0.1.0-blue)
+![hermes](https://img.shields.io/badge/hermes-v2026.4.16+-purple)
+
+Automatically rotate OpenCode Zen API keys to avoid rate limits and dead key
+downtime. Dashboard UI + agent integration in one plugin.
+
+---
 
 ## Features
 
-- **Timed rotation** — swap keys every N seconds (default: 600s, min: 30s)
-- **Per-API-call rotation** — rotate after N API calls
-- **Per-session rotation** — rotate on each Hermes agent start
-- **Auto rate-limit recovery** — detects 429 errors and insta-swaps keys
-- **Dead-key blacklisting** — 401/403 errors blacklist the offending key for 24h,
-  skips it during rotation; falls back to key[0] if all keys are blacklisted
-- **WebUI dashboard** — manage keys and config from Hermes Dashboard
-  (`hermes dashboard` → ZenShift tab)
-- **Zero-config** — install, paste keys, set interval, forget
+- **Manage multiple Zen API keys** — add, remove, view masked keys
+- **Three rotation strategies:**
+  - `session` — rotate on each new agent session
+  - `timed` — rotate every N seconds (default: 600s / 10 min)
+  - `api_call` — rotate after N tool calls
+- **Auto-blacklist dead keys** — 404/401/403 responses blacklist for 24h
+- **Rate-limit auto-rotation** — 429 / quota errors trigger rotate immediately
+- **Env integration** — writes active key to `~/.hermes/.env` as
+  `OPENCODE_ZEN_API_KEY`
+- **Agent integration** — patches Hermes error classifier + client for
+  fully automatic operation
 
 ## Installation
 
 ```bash
-# Copy plugin to Hermes plugins directory
-cp -r zenshift ~/.hermes/plugins/
+# Clone into Hermes plugins directory
+git clone https://github.com/zo/zenshift ~/.hermes/plugins/zenshift
 
-# Enable the plugin
-hermes config set plugins.enabled '["zenshift"]'
-
-# Restart Hermes
+# Enable in config.yaml
+hermes config set plugins.enabled += zenshift
 ```
+
+**Requires:** `hermes >= v2026.4.16` (dashboard plugin system).
 
 ## Usage
 
-1. Run `hermes dashboard` and open the browser
-2. Click the **ZenShift** tab
-3. Paste your OpenCode Zen API keys (one per line) in the text box
-4. Choose a rotation strategy and interval
-5. Click **Save** — ZenShift handles the rest
+### Dashboard UI
 
-## Files
+1. Start the dashboard: `hermes dashboard`
+2. Open the **ZenShift** tab (appears after Config)
+3. Paste your Zen API keys (one per line) → **Save Keys**
+4. Configure rotation strategy + parameters → **Apply**
+
+### API Routes
+
+All routes mounted at `/api/plugins/zenshift/`:
+
+| Method | Path              | Description                  |
+|--------|-------------------|------------------------------|
+| GET    | `/status`         | Plugin status + active key   |
+| GET    | `/keys`           | List all keys (masked)       |
+| POST   | `/keys`           | Replace key list             |
+| POST   | `/rotate`         | Force rotate to next key     |
+| POST   | `/config`         | Update rotation strategy     |
+| POST   | `/report-error`   | Report API error for action  |
+| POST   | `/report-tool-call` | Count tool call (api_call) |
+| POST   | `/reset-session`  | Reset session counter        |
+| GET    | `/check-timed`    | Check timed rotation due     |
+
+### CLI Commands
+
+```bash
+# Force rotate the active key
+zenshift rotate-now
+
+# Check current status
+curl http://127.0.0.1:9119/api/plugins/zenshift/status
+```
+
+## Architecture
 
 ```
-zenshift/
-├── plugin.yaml                    # Plugin manifest
-├── __init__.py                    # Plugin entry point (register())
-├── zenshift_integration.py        # Hermes agent runtime monkey-patches
+~/.hermes/plugins/zenshift/
+├── __init__.py                  # Agent plugin registration
+├── plugin.yaml                  # Plugin manifest
+├── zenshift_integration.py      # Agent integration (error feed, key injection)
 ├── dashboard/
-│   ├── manifest.json              # Dashboard manifest
-│   ├── plugin_api.py              # Backend API (FastAPI APIRouter)
+│   ├── manifest.json            # Dashboard plugin manifest
+│   ├── plugin_api.py            # FastAPI backend (9 routes)
 │   └── dist/
-│       ├── index.js               # Frontend React component
-│       └── style.css              # Dashboard styling
-├── .gitignore
-└── README.md
+│       ├── index.js             # React frontend (Preact SDK)
+│       └── style.css            # Dashboard styles
 ```
 
-## Strategies
+## State
 
-| Strategy | Description |
-|----------|-------------|
-| `timed` | Rotate every N seconds. Best for "set and forget" |
-| `api_call` | Rotate after every N successful API calls |
-| `session` | Rotate once when Hermes starts (calls `register()`) |
+- **Key list + config** persisted to `~/.hermes/zenshift-state.json`
+- **Active key** synced to `~/.hermes/.env` as `OPENCODE_ZEN_API_KEY`
+- **Blacklist** persists across restarts (24h expiry, wall-clock)
 
-## Error handling
+## Development
 
-| API Response | ZenShift Action |
-|-------------|----------------|
-| 429 / rate-limit | Rotate to next valid key immediately |
-| 401 / 403 / invalid key | Blacklist key for 24h, rotate to next valid |
-| All keys blacklisted | Fall back to key[0] |
-| Unrecognized error | Pass through, no rotation |
+```bash
+# Frontend
+cd dashboard
+npm install
+npm run build
+```
 
-## Requirements
-
-- Hermes Agent 0.16.0+
-- OpenCode Zen API keys
+The frontend uses the Hermes Plugin SDK (`window.__HERMES_PLUGIN_SDK__`).
+API calls use `API_BASE = "/api/plugins/zenshift"`.
 
 ## License
 

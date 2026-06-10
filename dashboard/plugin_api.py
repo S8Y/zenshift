@@ -37,6 +37,7 @@ PLUGIN_VERSION = "0.1.0"
 
 ENV_VAR_NAME = "OPENCODE_ZEN_API_KEY"
 STATE_DIR = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+STATE_FILE = str(STATE_DIR / "zenshift-state.json")
 
 _keys: list[str] = []
 _blacklist: dict[str, float] = {}
@@ -53,7 +54,7 @@ _total_rotations: int = 0
 _total_blacklists: int = 0
 _session_key_used: bool = False
 
-_lock = threading.Lock()
+_lock = threading.RLock()
 
 
 def _load_env_file() -> dict[str, str]:
@@ -99,6 +100,68 @@ def _write_env_file(updates: dict[str, str]) -> bool:
     except Exception:
         return False
 
+_STATE_KEYS = {"_keys", "_active_key_index", "_strategy", "_interval_seconds",
+    "_api_calls_before_rotate", "_total_rotations", "_total_blacklists"}
+
+def _save_state() -> None:
+    """Persist full plugin state to disk."""
+    with _lock:
+        try:
+            state = {"v": 1, "saved_at": time.time()}
+            bl = {}
+            now_mono = time.monotonic()
+            now_wall = time.time()
+            for k, v in _blacklist.items():
+                remaining = max(0, v - now_mono)
+                bl[k] = now_wall + remaining if remaining > 0 else 0.0
+            state["bl"] = bl
+            state["ki"] = _active_key_index
+            state["keys"] = list(_keys)
+            state["str"] = _strategy
+            state["int"] = _interval_seconds
+            state["apic"] = _api_calls_before_rotate
+            state["api_ct"] = _api_call_counter
+            state["rot"] = _total_rotations
+            state["nbl"] = _total_blacklists
+            state["sk"] = _session_key_used
+            p = Path(STATE_FILE)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps(state))
+        except Exception:
+            pass  # best-effort save
+
+def _load_state() -> None:
+    """Restore full plugin state from disk."""
+    global _keys, _active_key_index, _blacklist, _strategy
+    global _interval_seconds, _api_calls_before_rotate, _api_call_counter
+    global _total_rotations, _total_blacklists, _session_key_used
+    p = Path(STATE_FILE)
+    if not p.exists():
+        return
+    try:
+        state = json.loads(p.read_text())
+        if state.get("v") != 1:
+            return
+        now_mono = time.monotonic()
+        now_wall = time.time()
+        bl = {}
+        for k, expires_wall in state.get("bl", {}).items():
+            remaining = expires_wall - now_wall
+            if remaining > 0:
+                bl[k] = now_mono + remaining
+        _blacklist = bl
+        _keys = list(state.get("keys", []))
+        _active_key_index = state.get("ki", 0)
+        _strategy = state.get("str", "session")
+        _interval_seconds = state.get("int", 600)
+        _api_calls_before_rotate = state.get("apic", 10)
+        _api_call_counter = state.get("api_ct", 0)
+        _total_rotations = state.get("rot", 0)
+        _total_blacklists = state.get("nbl", 0)
+        _session_key_used = state.get("sk", False)
+    except Exception:
+        pass
+
 
 def _apply_key(key: str | None) -> None:
     global _active_key
@@ -118,23 +181,18 @@ def _rotate_to_next() -> str | None:
         if not _keys:
             return None
         now = time.monotonic()
-        # Build set of valid (non-blacklisted or expired) key indices
         valid_set = {
             i for i, k in enumerate(_keys)
             if k not in _blacklist or _blacklist[k] <= now
         }
         if not valid_set:
-            # All keys blacklisted — still use index 0 as fallback
             _active_key_index = 0
         elif _active_key_index in valid_set:
-            # Normal case: advance to the next valid key (circular)
             sorted_valid = sorted(valid_set)
             cur = sorted_valid.index(_active_key_index)
             nxt = (cur + 1) % len(sorted_valid)
             _active_key_index = sorted_valid[nxt]
         else:
-            # Current key was just blacklisted — find the next valid key
-            # with a higher index, or wrap to the first valid key
             sorted_valid = sorted(valid_set)
             nxt = None
             for idx in sorted_valid:
@@ -142,21 +200,27 @@ def _rotate_to_next() -> str | None:
                     nxt = idx
                     break
             if nxt is None:
-                nxt = sorted_valid[0]  # wrap around to first valid
+                nxt = sorted_valid[0]
             _active_key_index = nxt
         key = _keys[_active_key_index]
         _apply_key(key)
         _last_rotate_time = time.monotonic()
         _total_rotations += 1
         _session_key_used = True
+        _save_state()
         return key
 
 
 def _init_from_env() -> None:
     global _active_key
+    _load_state()
     current = os.environ.get(ENV_VAR_NAME) or _load_env_file().get(ENV_VAR_NAME)
     if current:
         _active_key = current
+    elif _keys:
+        idx = min(_active_key_index, len(_keys) - 1)
+        _apply_key(_keys[idx])
+        _last_rotate_time = time.monotonic()
 
 
 # ── Error patterns ─────────────────────────────────────────────────────────
@@ -263,6 +327,7 @@ def set_keys(data: dict):
         _last_rotate_time = time.monotonic()
         if _keys:
             _apply_key(_keys[0])
+    _save_state()
     return {"status": "ok", "count": len(cleaned)}
 
 
@@ -290,6 +355,7 @@ def set_config(data: dict):
             _interval_seconds = max(30, int(data["interval_seconds"]))
         if "api_calls_before_rotate" in data:
             _api_calls_before_rotate = max(1, int(data["api_calls_before_rotate"]))
+    _save_state()
     return get_status()
 
 
@@ -353,6 +419,7 @@ def reset_session():
         _session_key_used = False
     if _strategy == "session":
         _rotate_to_next()
+        _save_state()
         return {"status": "rotated_for_new_session", "strategy": "session"}
     return {"status": "ok", "strategy": _strategy}
 
@@ -374,4 +441,8 @@ def check_timed():
     }
 
 
-_init_from_env()
+# ── Module-level init ──────────────────────────────────────────────────────
+try:
+    _init_from_env()
+except Exception:
+    pass

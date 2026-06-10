@@ -1,4 +1,4 @@
-"""ZenShift plugin — OpenCode Zen API key rotation manager."""
+"""ZenShift — OpenCode Zen API key rotation manager for Hermes Agent."""
 from __future__ import annotations
 
 import logging
@@ -10,29 +10,26 @@ def register(ctx):
     """Register the ZenShift plugin.
 
     Two responsibilities:
-      1. The ZenShift dashboard backend is auto-mounted by the Hermes dashboard
-         runtime via dashboard/manifest.json (FastAPI APIRouter).
-      2. Install automatic integration hooks that feed API errors back into
-         ZenShift for auto-rotation: patches os.environ, hooks the agent'''s
-         error classifier, and runs a background timed-rotation thread.
+      1. Dashboard backend (FastAPI APIRouter) — auto-mounted by the
+         Hermes dashboard via dashboard/manifest.json at startup.
+      2. Agent integration hooks — feed API errors back for auto-rotation,
+         patch os.environ, run background timed-rotation thread.
 
-    All integration patches are in zenshift.zenshift_integration.install().
+    Integration is best-effort; the dashboard UI works independently.
     """
-    # Dashboard UI registration
-    logger.info("ZenShift plugin loaded -- dashboard UI available at /zenshift")
+    logger.info("ZenShift v0.1.0 — dashboard UI at /zenshift")
 
-    # Automatic integration (best-effort)
+    # Automatic integration (best-effort — may fail if Hermes agent
+    # internals are not importable in this process, e.g. dashboard-only).
     try:
         from zenshift.zenshift_integration import install as _install_integration
         _install_integration()
         logger.info("ZenShift auto-integration installed")
-    except ImportError as exc:
+    except ImportError:
         logger.info(
-            "ZenShift auto-integration skipped (agent modules not available): %s",
-            exc,
+            "ZenShift auto-integration skipped (agent modules not available)"
         )
     except Exception as exc:
         logger.warning("ZenShift auto-integration failed: %s", exc)
 
     return None
-
